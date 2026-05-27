@@ -1,121 +1,55 @@
-# import torch
-# from transformers import AutoProcessor, AutoModelForCausalLM, GenerationConfig
-# from PIL import Image
-
-# # -------------------------
-# # Device & dtype setup
-# # -------------------------
-# if torch.cuda.is_available():
-#     device = "cuda:7"
-#     torch_dtype = torch.float16  # FP16 for GPU
-#     device_map = {"": 7}         # assign model to GPU 0 (change if multiple GPUs)
-# else:
-#     device = "cpu"
-#     torch_dtype = torch.float32  # FP32 for CPU
-#     device_map = {"": "cpu"}
-
-# # -------------------------
-# # Load processor and model
-# # -------------------------
-# # model_path = '/projects/data/vision-team/venkat_kesav/GR_Model_Training_with_Swift/final_outputs/batch_7-14_200k_docs/output_5555/v0-20250708-204650/checkpoint-22000'
-# model_path = 'bharatgenai/patram-7b-instruct'
-
-# processor = AutoProcessor.from_pretrained(
-#     model_path,
-#     trust_remote_code=True,
-#     device_map=device_map
-# )
-
-# model = AutoModelForCausalLM.from_pretrained(
-#     model_path,
-#     trust_remote_code=True,
-#     device_map=device_map
-# )
-
-# # -------------------------
-# # Function to get Patram response
-# # -------------------------
-# def get_patram_response(image_path, question, max_new_tokens=200):
-#     """
-#     Generate answer from Patram model for a local image and a text question.
-    
-#     Args:
-#         image_path (str): Path to a local image file (png/jpg).
-#         question (str): Question to ask about the image.
-#         max_new_tokens (int): Maximum number of tokens to generate.
-    
-#     Returns:
-#         str: Generated answer text or None if error occurs.
-#     """
-#     try:
-#         # Load the local image
-#         image = Image.open(image_path).convert("RGB")
-#     except Exception as e:
-#         print(f"Error loading image: {e}")
-#         return None
-
-#     # Format prompt
-#     prompt = f"Question: {question} Answer based on the image."
-
-#     # try:
-#     # Preprocess image and text
-#     import pdb; pdb.set_trace()
-#     inputs = processor.process(images=[image], text=prompt)
-
-#     # Ensure proper batch dimension and move to correct device
-#     inputs = {
-#         k: (v.unsqueeze(0).to(device) if v.ndim == 1 else v.to(device))
-#         for k, v in inputs.items()
-#     }
-#     import pdb; pdb.set_trace()
-#     # Generate output using Patram-specific method
-#     output = model.generate_from_batch(
-#         inputs,
-#         generation_config=GenerationConfig(max_new_tokens=max_new_tokens, stop_strings="<|endoftext|>"),
-#         tokenizer=processor.tokenizer
-#     )
-
-#     # Extract tokens generated beyond input
-#     generated_tokens = output[0, inputs['input_ids'].size(1):]
-#     response = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-
-#     return response
-#     # except Exception as e:
-#     #     print(f"Error during inference: {e}")
-#     #     return None
-
-# # -------------------------
-# # Example usage
-# # -------------------------
-# if __name__ == "__main__":
-#     image_input = "/projects/data/vision-team/shanmukha_sreevatsa/IMC/tb3.png"  # local image path
-#     question = "Who issued this notice?"
-#     answer = get_patram_response(image_input, question)
-
-#     if answer:
-#         print("Answer:", answer)
-#     else:
-#         print("No answer generated.")
-
+import argparse
+import logging
 import torch
-from transformers import AutoProcessor, AutoModelForCausalLM, GenerationConfig
-from PIL import Image
 import requests
+from PIL import Image
+from typing import Optional, Tuple
+from transformers import AutoProcessor, AutoModelForCausalLM, GenerationConfig
 
-# Model ID and device setup
-# model_id = "bharatgenai/patram-7b-instruct"
-model_id = '/projects/data/vision-team/venkat_kesav/GR_Model_Training_with_Swift/final_outputs/batch_7-14_200k_docs/output_5555/v0-20250708-204650/checkpoint-22004'
-device = "cuda:7" if torch.cuda.is_available() else "cpu"
-device = 'cuda:7'
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# Load processor and model
-processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    trust_remote_code=True
-).to(device)
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Run Patram-7B model inference.")
+    parser.add_argument("--model_id", type=str, default="bharatgenai/patram-7b-instruct",
+                        help="Hugging Face model ID or local path to Patram model")
+    parser.add_argument("--image_path", type=str, required=True,
+                        help="Local path or URL to the image")
+    parser.add_argument("--question", type=str, required=True,
+                        help="Question to ask about the image")
+    parser.add_argument("--max_new_tokens", type=int, default=200,
+                        help="Maximum number of tokens to generate")
+    parser.add_argument("--use_bfloat16", action="store_true",
+                        help="Use bfloat16 precision (recommended for H100)")
+    return parser.parse_args()
 
-def get_patram_response(image_path_or_url, question):
+def load_model_and_processor(model_id: str, use_bfloat16: bool) -> Tuple[AutoModelForCausalLM, AutoProcessor]:
+    """Loads the Patram model and processor."""
+    logger.info(f"Loading model: {model_id}")
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if use_bfloat16 and torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    if device == "cuda" and not use_bfloat16:
+        dtype = torch.float16
+
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        device_map="auto"
+    )
+    return model, processor
+
+def get_patram_response(
+    model: AutoModelForCausalLM,
+    processor: AutoProcessor,
+    image_path_or_url: str,
+    question: str,
+    max_new_tokens: int = 200
+) -> Optional[str]:
+    """Generates an answer from the Patram model given an image and a question."""
     try:
         # Load image
         if image_path_or_url.startswith("http"):
@@ -123,21 +57,24 @@ def get_patram_response(image_path_or_url, question):
         else:
             image = Image.open(image_path_or_url).convert("RGB")
     except Exception as e:
-        print(f"Error loading image: {e}")
+        logger.error(f"Error loading image: {e}")
         return None
 
     # Format the prompt as expected
     prompt = f"Question: {question} Answer based on the image."
+    
+    device = model.device
 
     try:
         # Preprocess image and text using the processor
         inputs = processor.process(images=[image], text=prompt)
+        # Ensure proper batch dimension and device
         inputs = {k: v.to(device).unsqueeze(0) for k, v in inputs.items()}
 
         # Generate output using model's generate_from_batch method (Patram-specific)
         output = model.generate_from_batch(
             inputs,
-            GenerationConfig(max_new_tokens=200, stop_strings="<|endoftext|>"),
+            GenerationConfig(max_new_tokens=max_new_tokens, stop_strings="<|endoftext|>"),
             tokenizer=processor.tokenizer
         )
 
@@ -146,12 +83,27 @@ def get_patram_response(image_path_or_url, question):
         response = processor.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
         return response
     except Exception as e:
-        print(f"Error during inference: {e}")
+        logger.error(f"Error during inference: {e}")
         return None
 
-# Example usage:
-image_input = "https://knowscope.in/wp-content/uploads/2025/05/cghd-nag.png"
-question = "Who issued this notice?"
-answer = get_patram_response(image_input, question)
-if answer:
-    print("Answer:", answer)
+def main():
+    args = parse_args()
+    
+    try:
+        model, processor = load_model_and_processor(args.model_id, args.use_bfloat16)
+        answer = get_patram_response(model, processor, args.image_path, args.question, args.max_new_tokens)
+        
+        if answer:
+            print("\n" + "="*50)
+            print(f"Question: {args.question}")
+            print("="*50)
+            print(f"Answer:\n{answer}")
+            print("="*50 + "\n")
+        else:
+            print("No answer generated.")
+            
+    except Exception as e:
+        logger.error(f"Execution failed: {e}")
+
+if __name__ == "__main__":
+    main()
